@@ -1,0 +1,164 @@
+---
+title: "Proyecto Módulo 1: Modelo Baseline de Pronóstico"
+subtitle: "Pharmaceutical, cosmetic and toiletry goods retailing — South Australia (Series ID A3349500K)"
+date: 2026-09-11
+author: "Juan Pablo Sanchez, Fatima Irais Zepeda, Javier Uc Ix, Matteo Nelson"
+format:
+  html:
+    embed-resources: true
+---
+
+## Introducción
+
+Este proyecto busca construir un modelo de pronóstico **baseline** para una serie de tiempo del comercio minorista australiano.
+
+Los datos provienen de `aus_retail`, contiene el volumen de ventas mensual (*Turnover*, en millones de dólares australianos) de distintos giros comerciales en cada estado/territorio de Australia, reportado por la Oficina Australiana de Estadística (ABS). Cada serie individual dentro de `aus_retail` está identificada por un `Series ID` único.
+
+A nuestro equipo le fue asignada la serie con `Series ID` **A3349500K**, correspondiente al giro **"Pharmaceutical, cosmetic and toiletry goods retailing"** en el estado de **South Australia**.
+
+El objetivo es: explorar la serie para entender su comportamiento (tendencia, estacionalidad, necesidad de estabilizar varianza); descomponerla con STL; separar los últimos 24 meses como conjunto de prueba; ajustar un modelo baseline (`SNAIVE` + `RW` con deriva sobre la serie ajustada estacionalmente) usando solo el conjunto de entrenamiento; evaluar su desempeño sobre el conjunto de prueba con `accuracy()` (reportando MASE) y un análisis de residuales; y, una vez validado, reentrenar con la serie completa para generar el pronóstico de los siguientes 24 meses fuera de muestra.
+
+
+## Datos
+
+```{r}
+#| message: false
+library(fpp3)
+
+mi_serie <- aus_retail |>
+  filter(`Series ID` == "A3349500K")
+
+mi_serie
+```
+
+## Miramos la serie completa y su patrón estacional
+
+Desplegamos la vista general de la serie, aqui podemos revisar que la serie tiene tendencia (creciente, decreciente, con quiebres) y si se nota un patrón que se repite cada año.
+```{r}
+mi_serie |>
+  autoplot(Turnover) +
+  labs(
+    title = "Venta de productos",
+    subtitle = "South Australia (Series ID A3349500K)",
+    y = "Turnover (millones de AUD)",
+    x = "Mes"
+  )
+```
+
+Aquí sobreponemos cada año como una línea distinta, para ver mejor la forma de ese patrón anual.
+```{r}
+mi_serie |>
+  gg_season(Turnover, labels = "right")
+```
+
+
+## Estabilización de la varianza.
+
+```{r}
+lambda_guerrero <- mi_serie |>
+  features(Turnover, features = guerrero) |>
+  pull(lambda_guerrero)
+
+lambda_guerrero
+```
+
+λ ≈ 0.15. Al estar bastante cerca de 0 confirma lo que se pensaba por las gráficas: la varianza de la serie crece junto con su nivel, y conviene se va a usar una transformación Box-Cox con ese lambda.
+
+## Descomposición STL, ahora sobre la serie ya transformada.
+
+```{r}
+mi_serie |>
+  autoplot(box_cox(Turnover, lambda_guerrero)) +
+  labs(
+    title = "Turnover transformado (Box-Cox, lambda = 0.15)",
+    y = "Turnover transformado",
+    x = "Mes"
+  )
+```
+
+En esta nueva versión, el tamaño de las oscilaciones estacionales debería verse mucho más parejo a lo largo de todo el histórico (ya no debería ir creciendo conforme sube el nivel de la serie).
+
+Descomposición STL sobre la serie transformada:
+
+```{r}
+mi_serie |>
+  model(
+    STL(box_cox(Turnover, lambda_guerrero) ~ trend(window = NULL) +
+                                              season(window = "periodic"),
+        robust = TRUE)
+  ) |>
+  components() |>
+  autoplot()
+```
+
+Las oscilaciones estacionales ya se ven de un tamaño bastante parejo a lo largo de todo el histórico a diferencia de la serie original, donde antes de transformar se veían más chicas al inicio y más grandes al final.
+
+En la descomposición STL se ve claramente: una tendencia fuerte y sostenida con una meseta entre 1990 y 2000, y luego siguiendo su ascenso, una estacionalidad muy marcada , típico de retail probablemente un pico fuerte en diciembre por temporada navideña y una caída en enero, y un residuo que se ve razonablemente centrado en cero.
+
+## Separar los últimos 24 meses como conjunto de prueba.
+
+```{r}
+serie_train <- mi_serie |> filter(Month <= max(Month) - 24)
+serie_test  <- mi_serie |> filter(Month >  max(Month) - 24)
+
+# Verificación rápida de que quedaron 24 meses en test
+nrow(serie_test)
+range(serie_train$Month)
+range(serie_test$Month)
+```
+
+Esto separa los últimos 24 meses como serie_test, y todo lo anterior como serie_train.
+
+## Ajustar el modelo baseline usando solo el conjunto de entrenamiento.
+
+```{r}
+baseline_spec <- decomposition_model(
+  STL(box_cox(Turnover, lambda_guerrero) ~ trend(window = NULL) +
+                                            season(window = "periodic"),
+      robust = TRUE),
+  RW(season_adjust ~ drift()),
+  SNAIVE(season_year)
+)
+
+fit_baseline <- serie_train |>
+  model(baseline = baseline_spec)
+
+fit_baseline
+```
+
+
+## Pronóstico sobre el conjunto de prueba y métricas de error (MASE obligatorio)
+
+```{r}
+fc_baseline <- fit_baseline |> forecast(h = nrow(serie_test))
+
+fc_baseline |>
+  accuracy(mi_serie) |>
+  select(.model, RMSE, MAE, MAPE, MASE)
+```
+
+
+```{r}
+fc_baseline |>
+  autoplot(mi_serie |> filter(Month >= max(Month) - 60)) +
+  labs(
+    title = "Pronóstico del modelo baseline vs. valores reales",
+    subtitle = "Conjunto de prueba: 2017-2018",
+    y = "Turnover (millones de AUD)",
+    x = "Mes"
+  )
+```
+
+
+```{r}
+fit_baseline |> gg_tsresiduals()
+```
+
+```{r}
+fit_baseline |>
+  augment() |>
+  features(.innov, ljung_box, lag = 24)
+```
+
+Juntando todo lo del paso 6: el modelo baseline (a) sobreestima el pronóstico a 24 meses (MASE≈5, se ve en la gráfica anterior) y (b) sus residuales todavía tienen estructura sin capturar. Conclusión: este modelo baseline no se ajusta adecuadamente para este horizonte.
+
